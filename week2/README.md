@@ -42,6 +42,5 @@ uv run python practice/check.py --n 3
 - `practice/ab_report.py` — A/B описаний.
 - `practice/failures.py` — сценарии ошибок для разбора.
 - `practice/report.md` — отчёт задания 1.
-- `full_report.md` — подробный разбор кода и решений (для защиты).
 - `practice/week02_agents.ipynb` — практика недели 2 (11 задач на openai-agents SDK).
 - `practice/sdk_tasks.py`, `practice/poi.sqlite`, `practice/data/` — функции и данные базы.
