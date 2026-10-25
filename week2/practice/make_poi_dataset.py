@@ -21,9 +21,11 @@ import ssl
 import time
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from pathlib import Path
+from uuid import uuid4
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent
 RAW = HERE / "data" / "rostov_poi.json"
 DB = HERE / "poi.sqlite"
 
@@ -90,10 +92,24 @@ def _tri(value: str | None) -> int | None:
     return None
 
 
+def _checked_path(path: Path) -> Path:
+    result = path.resolve()
+    if not result.is_relative_to(HERE):
+        raise ValueError("path_outside_practice")
+    return result
+
+
+def _save_raw(raw: dict) -> None:
+    destination = _checked_path(RAW)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _checked_path(destination.with_name(destination.name + "." + uuid4().hex + ".building"))
+    with temporary.open("x", encoding="utf-8") as out:
+        json.dump(raw, out, ensure_ascii=False, allow_nan=False)
+    temporary.replace(destination)
+
+
 def fetch_raw() -> dict:
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     elements, seen = [], set()
     for key in KEYS:
         q = f'[out:json][timeout:120];(node["{key}"]({BBOX});way["{key}"]({BBOX}););out tags center;'
@@ -102,7 +118,16 @@ def fetch_raw() -> dict:
                 req = urllib.request.Request(
                     mirror, data=urllib.parse.urlencode({"data": q}).encode(),
                     headers={"User-Agent": "mmcs-agentic-course/1.0 (teaching materials)"})
-                els = json.loads(urllib.request.urlopen(req, timeout=180, context=ctx).read())["elements"]
+                with urllib.request.urlopen(req, timeout=180, context=ctx) as response:
+                    payload = json.loads(response.read())
+                if not isinstance(payload, dict) or payload.get("remark"):
+                    raise ValueError("incomplete_overpass_response")
+                els = payload.get("elements")
+                if not isinstance(els, list) or any(
+                    not isinstance(e, dict) or e.get("type") not in ("node", "way")
+                    or type(e.get("id")) is not int for e in els
+                ):
+                    raise ValueError("invalid_overpass_response")
                 print(f"{key:12} {len(els):6} объектов ({mirror.split('/')[2]})")
                 for e in els:
                     eid = (e["type"], e["id"])
@@ -110,12 +135,16 @@ def fetch_raw() -> dict:
                         seen.add(eid)
                         elements.append(e)
                 break
-            except Exception as exc:
-                print(f"{key:12} {mirror.split('/')[2]}: {type(exc).__name__}")
+            except Exception:
+                print(f"{key:12}: зеркало недоступно или ответ неполон; подробности скрыты")
                 time.sleep(3)
-    RAW.parent.mkdir(parents=True, exist_ok=True)
-    RAW.write_text(json.dumps({"elements": elements}, ensure_ascii=False), encoding="utf-8")
-    return {"elements": elements}
+        else:
+            raise RuntimeError("incomplete_download_snapshot_unchanged")
+    if not elements:
+        raise ValueError("empty_download_snapshot_unchanged")
+    raw = {"elements": elements}
+    _save_raw(raw)
+    return raw
 
 
 def rows_from(raw: dict) -> list[tuple]:
@@ -157,13 +186,24 @@ def rows_from(raw: dict) -> list[tuple]:
 
 
 def build(rows: list[tuple]) -> None:
-    if DB.exists():
-        DB.unlink()
-    con = sqlite3.connect(DB)
-    con.executescript(SCHEMA)
-    con.executemany(f"INSERT INTO poi VALUES ({', '.join(['?'] * 19)})", rows)
-    con.commit()
-    con.close()
+    """Build beside the target; a failed build leaves the original DB untouched.
+
+    Failed .building files are retained for inspection; existing files are never
+    deleted as cleanup. Only a successful, closed, verified DB replaces the target.
+    """
+    destination = _checked_path(DB)
+    if not rows:
+        raise ValueError("empty_dataset")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _checked_path(destination.with_name(destination.name + "." + uuid4().hex + ".building"))
+    with closing(sqlite3.connect(temporary)) as con:
+        con.executescript(SCHEMA)
+        con.executemany(f"INSERT INTO poi VALUES ({', '.join(['?'] * 19)})", rows)
+        con.commit()
+        if (con.execute("PRAGMA integrity_check").fetchone()[0] != "ok"
+                or con.execute("SELECT COUNT(*) FROM poi").fetchone()[0] != len(rows)):
+            raise ValueError("database_verification_failed")
+    temporary.replace(destination)
 
 
 def report() -> None:
@@ -190,10 +230,16 @@ def main() -> None:
     p.add_argument("--refresh", action="store_true", help="выкачать данные заново")
     args = p.parse_args()
 
-    raw = fetch_raw() if args.refresh or not RAW.exists() else json.loads(RAW.read_text(encoding="utf-8"))
-    rows = rows_from(raw)
-    build(rows)
-    report()
+    try:
+        raw = fetch_raw() if args.refresh or not RAW.exists() else json.loads(RAW.read_text(encoding="utf-8"))
+        rows = rows_from(raw)
+        build(rows)
+        # Do not dump POI names or contacts into diagnostics.
+        print(f"База проверена и заменена. Строк: {len(rows)}")
+    except Exception:
+        print("Сборка не завершена; подробности ошибки скрыты. "
+              "При сбое построения прежняя база сохранена.")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

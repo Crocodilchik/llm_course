@@ -1,0 +1,22 @@
+[
+  {"query":"пельмени","cuisines":["russian","regional"],"relation":"related_cuisine_not_menu"},
+  {"query":"русская кухня","cuisines":["russian","regional"]},
+  {"query":"местная кухня","cuisines":["regional","russian"]},
+  {"query":"хочу пиццу","cuisines":["pizza","italian"]},
+  {"query":"итальянская кухня","cuisines":["italian","pizza"]},
+  {"query":"японские роллы","cuisines":["sushi","japanese"]},
+  {"query":"суши","cuisines":["sushi","japanese"]},
+  {"query":"хочу бургер","cuisines":["burger"]},
+  {"query":"сэндвичи","cuisines":["sandwich","burger"]},
+  {"query":"кофейня","cuisines":["coffee_shop"]},
+  {"query":"чашка кофе","cuisines":["coffee_shop"]},
+  {"query":"шашлык","cuisines":["kebab","barbecue","кавказская"]},
+  {"query":"грузинская кухня","cuisines":["georgian"]},
+  {"query":"блюда из курицы","cuisines":["chicken"]},
+  {"query":"немецкая кухня","cuisines":["german"]},
+  {"query":"отремонтировать грузовик","expected_empty":true},
+  {"query":"юридическая консультация","expected_empty":true},
+  {"query":"покраска стен","expected_empty":true},
+  {"query":"квантовый компьютер","expected_empty":true},
+  {"query":"заправить автомобиль бензином","expected_empty":true}
+]

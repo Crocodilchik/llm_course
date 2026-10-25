@@ -1,35 +1,12 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
+# Only the assignment, public guide and final project belong to this week.
+/*
+!/.gitignore
+!/README.md
+!/assignment.md
+!/practice/
 
-# Virtual environment
-.venv/
-venv/
-
-# Environment / secrets
-.env
-.env.*
-!.env.example
-
-# Testing / caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# IDE / OS
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
-
-# Logs
+# Working reports, exported documents and intermediate materials stay local.
+full_report*
+reports/
 *.log
-
-# Личный отчёт (только для локального чтения, не для репозитория)
-full_report.md
+*.log.*

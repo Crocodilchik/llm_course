@@ -4,9 +4,8 @@
 Задание 1, пункт 2: «Прогнать десять задач по три раза: uv run python check.py --n 3.
 В отчёт — pass@1 и pass^3, средние токены и стоимость задачи, число шагов».
 
-Что считается «решённой» задачей: финальный ответ агента содержит эталонное число
-(или ключевую строку), которое пересчитывается по базе без участия модели. Задача
-сформулирована так, чтобы правильный ответ зависел только от базы, а не от мнения.
+Успех проверяется по типизированным данным финального JSON, а не по подстроке.
+Стоимость измеряется токенами. Все попытки начинают с новой истории сообщений.
 
 Запуск (из week2/practice):
     uv run python check.py --n 3              # вариант 'full'
@@ -16,13 +15,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
-import os
+import sqlite3
 import statistics
 import sys
+from contextlib import closing
 from pathlib import Path
+from uuid import uuid4
 
-from dotenv import load_dotenv
 from openai import OpenAI
 
 # Чтобы `import sdk_tasks` и `from agent_loop import ...` работали независимо от
@@ -30,14 +32,16 @@ from openai import OpenAI
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sdk_tasks
-from agent_loop import cost_rub, run_agent, save_run
+from agent_loop import (RUNS_DIR, inside_practice, load_client, positive_int,
+                        run_agent, save_run, valid_id)
+from answer_schema import parse_answer
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # 10 ЗАДАЧ С ЭТАЛОНАМИ
 # ────────────────────────────────────────────────────────────────────────────
-# Каждая задача: (вопрос, эталон-строка). «Решена» = эталон встречается в ответе.
-# Эталоны пересчитаны по базе poi.sqlite напрямую (SQL-запросами, без модели).
+# Каждая задача: (вопрос, ожидаемое значение или обязательный элемент ответа).
+# Эталоны пересчитаны по базе poi.sqlite (см. full_report.md, раздел «Эталоны»).
 TASKS: list[tuple[str, str]] = [
     # 1. Счёт круглосуточных аптек: только count_places(kind=pharmacy, only_24_7=True).
     ("Сколько в Ростове круглосуточных аптек?", "19"),
@@ -62,9 +66,48 @@ TASKS: list[tuple[str, str]] = [
 ]
 
 
-def is_solved(final_answer: str | None, expected: str) -> bool:
-    """Задача решена, если эталонная строка есть в финальном ответе."""
-    return bool(final_answer) and expected in final_answer
+def is_solved(final_answer: dict | str | None, task_index: int) -> bool:
+    """Grade outcome facts; the A/B tool-choice grader is deliberately separate."""
+    try:
+        answer = parse_answer(final_answer)
+    except (ValueError, TypeError):
+        return False
+    if not 0 <= task_index < len(TASKS):
+        raise ValueError("unknown_task")
+    expected = TASKS[task_index][1]
+    if task_index < 6:
+        return answer["type"] == "count" and answer["count"] == int(expected)
+    # Read-only connection: missing DB cannot create an empty replacement.
+    with closing(sqlite3.connect(sdk_tasks.DB.resolve().as_uri() + "?mode=ro", uri=True)) as con:
+        con.row_factory = sqlite3.Row
+        if task_index == 6:
+            if answer["type"] != "places":
+                return False
+            truth = {r["id"]: r["name"] for r in con.execute(
+                "SELECT id, name FROM poi WHERE kind = ? AND street LIKE ?", ("cafe", "%Пушкин%"))}
+            places = answer["places"]
+            ids = [p["id"] for p in places]
+            return (len(ids) == len(set(ids)) and any(p["name"] == expected for p in places)
+                    and all(p["id"] in truth and p["name"] == truth[p["id"]] for p in places))
+        if task_index in (7, 8):
+            if answer["type"] != "nearest":
+                return False
+            lat, lon, kind = ((47.2940, 39.8880, "pharmacy") if task_index == 7
+                              else (47.2690, 39.7170, "school"))
+            places = list(con.execute("SELECT id, name, lat, lon FROM poi WHERE kind = ?", (kind,)))
+            if not places:
+                return False
+            distance = lambda p: sdk_tasks.distance_m(lat, lon, p["lat"], p["lon"])
+            best = min(places, key=distance)
+            return (answer["place"]["id"] == best["id"]
+                    and answer["place"]["name"] == best["name"]
+                    and answer["distance_m"] == distance(best))
+        if answer["type"] != "brands":
+            return False
+        truth = {r[0] for r in con.execute(
+            "SELECT DISTINCT COALESCE(brand, 'без бренда') FROM poi WHERE kind = ?", ("outpost",))}
+        brands = answer["brands"]
+        return expected in brands and len(brands) == len(set(brands)) and set(brands) <= truth
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -74,12 +117,24 @@ def pass_at_k(solved_matrix: list[list[bool]], k: int) -> float:
     """Доля задач, решённых хотя бы одной из первых k попыток.
 
     solved_matrix — список строк: по одной на задачу, по одной ячейке на попытку.
-    pass@1 — доля задач, решённых с первой попытки; pass^3 — хотя бы одной из трёх.
+    pass@1 — доля задач, решённых с первой попытки; pass@3 — хотя бы одной из трёх.
     """
-    if not solved_matrix:
-        return 0.0
+    _validate_matrix(solved_matrix, k)
     ok = sum(1 for attempts in solved_matrix if any(attempts[:k]))
-    return round(ok / len(solved_matrix), 3)
+    return ok / len(solved_matrix)
+
+
+def _validate_matrix(matrix: list[list[bool]], k: int) -> None:
+    if (type(k) is not int or k < 1 or not matrix
+            or any(len(row) != len(matrix[0]) or len(row) < k
+                   or any(type(x) is not bool for x in row) for row in matrix)):
+        raise ValueError("incomplete_or_invalid_results_matrix")
+
+
+def pass_power_k(solved_matrix: list[list[bool]], k: int) -> float:
+    """Fraction of tasks for which ALL k attempts succeeded; not pass@1 ** k."""
+    _validate_matrix(solved_matrix, k)
+    return sum(all(row[:k]) for row in solved_matrix) / len(solved_matrix)
 
 
 def wilson_interval(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -90,6 +145,8 @@ def wilson_interval(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
         радиус = z/(1 + z²/n) * sqrt(p(1-p)/n + z²/4n²)
     Возвращает (нижняя, верхняя) границы. Используется в A/B (Фаза 4).
     """
+    if type(n) is not int or n < 0 or not 0 <= p <= 1:
+        raise ValueError("invalid_proportion")
     if n == 0:
         return 0.0, 1.0
     denom = 1 + z * z / n
@@ -101,68 +158,84 @@ def wilson_interval(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
 # ────────────────────────────────────────────────────────────────────────────
 # ГЛАВНЫЙ ПРОГОН
 # ────────────────────────────────────────────────────────────────────────────
+def token_summary(traces: list[dict], n_tasks: int) -> dict:
+    if not traces or n_tasks < 1:
+        raise ValueError("empty_experiment")
+    complete = all(t.get("usage_complete", True)
+                   and type(t.get("input_tokens")) is int and t["input_tokens"] >= 0
+                   and type(t.get("output_tokens")) is int and t["output_tokens"] >= 0
+                   for t in traces)
+    if not complete:
+        return dict(avg_input=None, avg_output=None, avg_total=None, tokens_per_task=None,
+                    unknown_usage=sum(not t.get("usage_complete", True)
+                                      or t.get("input_tokens") is None
+                                      or t.get("output_tokens") is None for t in traces))
+    ins = sum(t["input_tokens"] for t in traces)
+    outs = sum(t["output_tokens"] for t in traces)
+    return dict(avg_input=ins / len(traces), avg_output=outs / len(traces),
+                avg_total=(ins + outs) / len(traces), tokens_per_task=(ins + outs) / n_tasks,
+                unknown_usage=0)
+
+
+def run_suite(client: OpenAI, model: str, n: int, variant: str, max_steps: int,
+              experiment_id: str) -> list[dict]:
+    traces = []
+    suite_fingerprint = hashlib.sha256(
+        (json.dumps(TASKS, ensure_ascii=False) + hashlib.sha256(sdk_tasks.DB.read_bytes()).hexdigest()).encode()
+    ).hexdigest()
+    for index, (question, _) in enumerate(TASKS):
+        for attempt in range(1, n + 1):
+            trace = run_agent(client, model, question, variant, max_steps,
+                              experiment_id=experiment_id, task_id=f"task-{index + 1:02d}",
+                              attempt=attempt, planned_attempts=n)
+            trace["suite_fingerprint"] = suite_fingerprint
+            try:
+                trace["solved"] = not trace["error"] and is_solved(trace["final_answer"], index)
+                trace["evaluation_error"] = None
+            except Exception:
+                trace["solved"], trace["evaluation_error"] = False, "truth_unavailable"
+            save_run(trace)
+            traces.append(trace)
+            # Status only: never dump question, model, response, config or traceback.
+            print(f"{variant}: задача {index + 1}, попытка {attempt}: "
+                  f"{'успех' if trace['solved'] else 'неуспех'}")
+            if (trace["error"] or "").startswith("api_error") or trace["evaluation_error"]:
+                raise RuntimeError("experiment_interrupted_partial_trace_saved")
+    return traces
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Прогон 10 задач и метрики")
-    ap.add_argument("--n", type=int, default=3, help="число прогонов на задачу")
-    ap.add_argument("--variant", choices=("short", "full"), default="full",
+    ap.add_argument("--n", type=positive_int, default=3, help="число прогонов на задачу (1–100)")
+    ap.add_argument("--variant", choices=("short", "full", "both"), default="full",
                     help="вариант описаний инструментов (A/B)")
-    ap.add_argument("--max-steps", type=int, default=6, help="лимит шагов агента")
+    ap.add_argument("--max-steps", type=positive_int, default=6, help="лимит шагов агента (1–32)")
+    ap.add_argument("--experiment-id", type=valid_id, default=None)
     args = ap.parse_args()
 
-    # Читаем .env (поднимаясь вверх до корня репозитория).
-    for d in (Path.cwd(), *Path.cwd().parents):
-        if (d / ".env").exists():
-            load_dotenv(d / ".env")
-            break
-
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"],
-                    base_url=os.environ["OPENAI_BASE_URL"])
-    model = os.environ["MODEL"]
-
-    # Собираем матрицу результатов: rows = задачи, cols = попытки.
-    solved: list[list[bool]] = []
-    # Для средних токенов/стоимости/шагов копим сырые числа по всем прогонам.
-    all_inputs: list[int] = []
-    all_outputs: list[int] = []
-    all_steps: list[int] = []
-
-    print(f"Вариант описаний: {args.variant}, прогонов на задачу: {args.n}\n")
-    for qi, (question, expected) in enumerate(TASKS, 1):
-        attempts: list[bool] = []
-        for attempt in range(1, args.n + 1):
-            trace = run_agent(client, model, question, args.variant, args.max_steps)
-            save_run(trace)
-            ok = is_solved(trace["final_answer"], expected)
-            attempts.append(ok)
-            all_inputs.append(trace["input_tokens"])
-            all_outputs.append(trace["output_tokens"])
-            all_steps.append(trace["steps"])
-            mark = "✓" if ok else "✗"
-            print(f"  {qi:2d}.{attempt} {mark}  '{question}' → {trace['final_answer']!r}")
-        solved.append(attempts)
-
-    n_tasks = len(TASKS)
-    total_runs = n_tasks * args.n
-    avg_in = statistics.mean(all_inputs)
-    avg_out = statistics.mean(all_outputs)
-    avg_steps = statistics.mean(all_steps)
-    # Средняя стоимость одной задачи = сумма стоимости всех прогонов / число задач.
-    total_cost = sum(cost_rub(i, o) for i, o in zip(all_inputs, all_outputs))
-    avg_cost_task = total_cost / n_tasks
-
-    p1 = pass_at_k(solved, 1)
-    pk = pass_at_k(solved, args.n)
-
-    print("\n" + "=" * 60)
-    print("РЕЗУЛЬТАТ")
-    print("=" * 60)
-    print(f"задач: {n_tasks}, прогонов на задачу: {args.n}")
-    print(f"pass@1: {p1}")
-    print(f"pass^{args.n}: {pk}")
-    print(f"средние токены на прогон: {avg_in:.0f} вход / {avg_out:.0f} выход")
-    print(f"средняя стоимость задачи: {avg_cost_task:.6f} ₽")
-    print(f"среднее число шагов на прогон: {avg_steps:.1f}")
-    print(f"всего прогонов: {total_runs}, общая стоимость: {total_cost:.6f} ₽")
+    if args.n > 100 or args.max_steps > 32:
+        ap.error("n должно быть 1–100, max-steps — 1–32")
+    experiment_id = args.experiment_id or uuid4().hex
+    variants = ("short", "full") if args.variant == "both" else (args.variant,)
+    if inside_practice(RUNS_DIR / f"experiment_{experiment_id}.jsonl").exists():
+        ap.error("идентификатор уже использован; выберите новый эксперимент")
+    print(f"Эксперимент: {experiment_id}")
+    try:
+        client, model = load_client()
+        with client:
+            for variant in variants:
+                traces = run_suite(client, model, args.n, variant, args.max_steps, experiment_id)
+                solved = [[t["solved"] for t in traces if t["task_id"] == f"task-{i+1:02d}"]
+                          for i in range(len(TASKS))]
+                print(f"{variant}: pass@1={pass_at_k(solved, 1):.6f}; "
+                      f"pass^{args.n}={pass_power_k(solved, args.n):.6f}; "
+                      f"pass@{args.n}={pass_at_k(solved, args.n):.6f}")
+                print("Расход токенов:", json.dumps(token_summary(traces, len(TASKS))))
+                print(f"Среднее число шагов: {statistics.mean(t['steps'] for t in traces):.3f}")
+    except Exception:
+        print("Эксперимент не завершён. Доступные траектории сохранены; "
+              "подробности ошибки скрыты. Итоговые метрики неполного эксперимента не выводятся.")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
